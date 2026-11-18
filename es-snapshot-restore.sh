@@ -18,6 +18,7 @@ set -uo pipefail
 SCRIPT_VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
+readonly POLL_INTERVAL=30   # seconds between progress checks (snapshot and restore)
 
 # ----------------------------------------------------------------------------
 # Output / logging
@@ -180,15 +181,11 @@ load_config() {
 
   : "${SOURCE_ES_URL:=}" "${SOURCE_ES_USER:=}" "${SOURCE_ES_PASS:=}" "${SOURCE_CA_CERT:=}" "${SOURCE_INSECURE_TLS:=false}"
   : "${DEST_ES_URL:=}" "${DEST_ES_USER:=}" "${DEST_ES_PASS:=}" "${DEST_CA_CERT:=}" "${DEST_INSECURE_TLS:=false}"
-  : "${SOURCE_REPO:=}" "${DEST_RO_REPO_FOR_SOURCE:=}" "${DEST_RO_REPO_CLIENT:=}" "${DEST_RO_REPO_MAX_RESTORE_BYTES_PER_SEC:=}"
-  : "${DEST_REPO:=}" "${SOURCE_RO_REPO_FOR_DEST:=}" "${SOURCE_RO_REPO_CLIENT:=}"
-  : "${SNAPSHOT_NAME_PREFIX:=migration}" "${SNAPSHOT_INDICES:=*,-.*}" "${SNAPSHOT_POLL_INTERVAL:=30}"
-  : "${LIST_SNAPSHOTS_FROM:=dest}" "${SNAPSHOT_LIST_LIMIT:=30}" "${ALLOW_PARTIAL_SNAPSHOTS:=false}"
-  : "${RESTORE_INDICES:=*,-.*}" "${RESTORE_INCLUDE_ALIASES:=true}" "${RESTORE_IGNORE_INDEX_SETTINGS:=}"
-  : "${ON_CONFLICT:=ask}" "${RESTORE_POLL_INTERVAL:=30}" "${CHECK_DISK_BEFORE_RESTORE:=true}" "${DISK_WATERMARK_PERCENT:=85}"
-  : "${EXPECTED_PRIMARY_SHARDS:=3}" "${EXPECTED_REPLICAS:=1}" "${VERIFY_COMPARE_WITH_SOURCE:=true}"
-  : "${DEST_TUNE_DURING_RESTORE:=false}" "${DEST_TUNE_RECOVERY_MAX_BYTES_PER_SEC:=}"
-  : "${DEST_TUNE_NODE_INITIAL_PRIMARIES_RECOVERIES:=}" "${DEST_TUNE_NODE_CONCURRENT_RECOVERIES:=}"
+  : "${SOURCE_REPO:=}" "${DEST_RO_REPO_FOR_SOURCE:=}"
+  : "${SNAPSHOT_NAME_PREFIX:=migration}" "${SNAPSHOT_INDICES:=*,-.*}" "${SNAPSHOT_LIST_LIMIT:=30}"
+  : "${RESTORE_INDICES:=*,-.*}" "${RESTORE_IGNORE_INDEX_SETTINGS:=}"
+  : "${ON_CONFLICT:=ask}" "${CHECK_DISK_BEFORE_RESTORE:=true}" "${DISK_WATERMARK_PERCENT:=85}"
+  : "${EXPECTED_PRIMARY_SHARDS:=3}" "${EXPECTED_REPLICAS:=1}"
   : "${CURL_CONNECT_TIMEOUT:=10}" "${CURL_MAX_TIME:=120}" "${CURL_LONG_MAX_TIME:=600}"
   : "${LOG_DIR:=./logs}" "${STATE_DIR:=./state}"
 
@@ -205,12 +202,10 @@ load_config() {
   SNAPSHOT_NAME_PREFIX=${SNAPSHOT_NAME_PREFIX,,}
 
   case $ON_CONFLICT in ask|abort|skip|delete) ;; *) die "Invalid ON_CONFLICT: '$ON_CONFLICT' (use ask|abort|skip|delete)" ;; esac
-  case $LIST_SNAPSHOTS_FROM in dest|source) ;; *) die "Invalid LIST_SNAPSHOTS_FROM: '$LIST_SNAPSHOTS_FROM' (use dest|source)" ;; esac
-  for v in SOURCE_INSECURE_TLS DEST_INSECURE_TLS ALLOW_PARTIAL_SNAPSHOTS RESTORE_INCLUDE_ALIASES CHECK_DISK_BEFORE_RESTORE \
-           VERIFY_COMPARE_WITH_SOURCE DEST_TUNE_DURING_RESTORE; do
+  for v in SOURCE_INSECURE_TLS DEST_INSECURE_TLS CHECK_DISK_BEFORE_RESTORE; do
     [[ ${!v} == true || ${!v} == false ]] || die "$v must be true or false (current: '${!v}')"
   done
-  for v in SNAPSHOT_POLL_INTERVAL SNAPSHOT_LIST_LIMIT RESTORE_POLL_INTERVAL DISK_WATERMARK_PERCENT EXPECTED_PRIMARY_SHARDS \
+  for v in SNAPSHOT_LIST_LIMIT DISK_WATERMARK_PERCENT EXPECTED_PRIMARY_SHARDS \
            EXPECTED_REPLICAS CURL_CONNECT_TIMEOUT CURL_MAX_TIME CURL_LONG_MAX_TIME; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be numeric (current: '${!v}')"
   done
@@ -342,20 +337,18 @@ preflight() {
 # ----------------------------------------------------------------------------
 # Read-only repository
 # ----------------------------------------------------------------------------
-# register_ro_repo <origin_side> <origin_repo> <target_side> <target_repo> <client> <max_restore>
+# register_ro_repo <origin_side> <origin_repo> <target_side> <target_repo>
+# Copies every setting of the original repository (type, container, base_path, client,
+# compress, throttles...) and only forces readonly=true.
 register_ro_repo() {
-  local o_side=$1 o_repo=$2 t_side=$3 t_repo=$4 client=$5 max_restore=$6
+  local o_side=$1 o_repo=$2 t_side=$3 t_repo=$4
   local o_lbl t_lbl new_loc existing existing_loc others
   o_lbl=$(side_label "$o_side"); t_lbl=$(side_label "$t_side")
 
   es_request "$o_side" GET "/_snapshot/$(urlenc "$o_repo")" \
     || { err "Could not read repository '$o_repo' on the $o_lbl cluster: $(es_error)"; return 1; }
   jq --arg r "$o_repo" '.[$r]' "$ES_RESP" >"$TMP_DIR/orig_repo.json"
-  jq --arg c "$client" --arg m "$max_restore" '
-      {type: .type,
-       settings: ((.settings // {}) + {readonly: true}
-                  + (if $c != "" then {client: $c} else {} end)
-                  + (if $m != "" then {max_restore_bytes_per_sec: $m} else {} end))}' \
+  jq '{type: .type, settings: ((.settings // {}) + {readonly: true})}' \
     "$TMP_DIR/orig_repo.json" >"$TMP_DIR/new_repo.json"
   new_loc=$(jq -r "$JQ_LIB"$'\n''repo_loc' "$TMP_DIR/new_repo.json")
 
@@ -390,17 +383,10 @@ register_repo_menu() {
   local c
   title "Register read-only repository"
   echo "1) SOURCE repo ('$SOURCE_REPO') -> DESTINATION as '$DEST_RO_REPO_FOR_SOURCE' (read-only)  [required for the restore]"
-  if [[ -n $DEST_REPO && -n $SOURCE_RO_REPO_FOR_DEST ]]; then
-    echo "2) DESTINATION repo ('$DEST_REPO') -> SOURCE as '$SOURCE_RO_REPO_FOR_DEST' (read-only)  [optional; writes metadata to production]"
-  else
-    echo "2) (unavailable: set DEST_REPO and SOURCE_RO_REPO_FOR_DEST)"
-  fi
   echo "0) Back"
   read -r -p "Option: " c || return 1
   case $c in
-    1) register_ro_repo source "$SOURCE_REPO" dest "$DEST_RO_REPO_FOR_SOURCE" "$DEST_RO_REPO_CLIENT" "$DEST_RO_REPO_MAX_RESTORE_BYTES_PER_SEC" ;;
-    2) [[ -n $DEST_REPO && -n $SOURCE_RO_REPO_FOR_DEST ]] || { err "Set DEST_REPO and SOURCE_RO_REPO_FOR_DEST."; return 1; }
-       register_ro_repo dest "$DEST_REPO" source "$SOURCE_RO_REPO_FOR_DEST" "$SOURCE_RO_REPO_CLIENT" "" ;;
+    1) register_ro_repo source "$SOURCE_REPO" dest "$DEST_RO_REPO_FOR_SOURCE" ;;
     *) return 0 ;;
   esac
 }
@@ -460,7 +446,7 @@ create_snapshot() {
 
 monitor_snapshot() {
   local name=$1 start=$SECONDS entry st sdone stotal sfailed i state
-  info "Polling every ${SNAPSHOT_POLL_INTERVAL}s (Ctrl+C stops only the monitoring; the snapshot keeps running on the cluster)."
+  info "Polling every ${POLL_INTERVAL}s (Ctrl+C stops only the monitoring; the snapshot keeps running on the cluster)."
   _INTERRUPTED=0
   trap '_INTERRUPTED=1' INT
   while (( ! _INTERRUPTED )); do
@@ -474,7 +460,7 @@ monitor_snapshot() {
     else
       warn "Failed to check status: $(es_error)"
     fi
-    sleep "$SNAPSHOT_POLL_INTERVAL"
+    sleep "$POLL_INTERVAL"
   done
   trap - INT
   if (( _INTERRUPTED )); then
@@ -495,96 +481,55 @@ monitor_snapshot() {
   state=$(jq -r '.state' "$TMP_DIR/snap.json")
   case $state in
     SUCCESS) ok "Snapshot '$name' completed with SUCCESS in $(fmt_duration $((SECONDS - start)))." ;;
-    PARTIAL) warn "Snapshot '$name' finished PARTIAL: $(jq -r '[.failures[]?.index] | unique | join(", ")' "$TMP_DIR/snap.json")" ;;
-    *) err "Snapshot '$name' finished with state $state."; return 1 ;;
+    PARTIAL) err "Snapshot '$name' finished PARTIAL (failed indices: $(jq -r '[.failures[]?.index] | unique | join(", ")' "$TMP_DIR/snap.json")). Only SUCCESS snapshots can be restored."; return 1 ;;
+    *) err "Snapshot '$name' finished with state $state. Only SUCCESS snapshots can be restored."; return 1 ;;
   esac
 }
 
-# Fills SNAP_IDS / SNAP_STATUSES and prints the table
-SNAP_IDS=(); SNAP_STATUSES=()
+# Lists only SUCCESS snapshots, always through the read-only repo on the DESTINATION
+# (no load on production). Fills SNAP_IDS and prints the table.
+SNAP_IDS=()
 list_snapshots() {
-  local side repo total id st ep dur nidx okc tot when i=0
-  if [[ $LIST_SNAPSHOTS_FROM == source ]]; then side=source; repo=$SOURCE_REPO; else side=dest; repo=$DEST_RO_REPO_FOR_SOURCE; fi
-  title "Snapshots in repository '$repo' (queried on the $(side_label $side) cluster)"
-  es_request "$side" GET "/_cat/snapshots/$(urlenc "$repo")?format=json&ignore_unavailable=true&h=id,status,start_epoch,duration,indices,successful_shards,total_shards" "" "$CURL_LONG_MAX_TIME" \
+  local repo=$DEST_RO_REPO_FOR_SOURCE total hidden id ep dur nidx okc tot when i=0
+  title "SUCCESS snapshots in repository '$repo' (queried on the DESTINATION cluster)"
+  es_request dest GET "/_cat/snapshots/$(urlenc "$repo")?format=json&ignore_unavailable=true&h=id,status,start_epoch,duration,indices,successful_shards,total_shards" "" "$CURL_LONG_MAX_TIME" \
     || { err "Failed to list snapshots: $(es_error)"; return 1; }
-  total=$(jq 'length' "$ES_RESP")
+  total=$(jq '[ .[] | select(.status == "SUCCESS") ] | length' "$ES_RESP")
+  hidden=$(jq '[ .[] | select(.status != "SUCCESS") ] | length' "$ES_RESP")
   jq -r --argjson lim "$SNAPSHOT_LIST_LIMIT" \
-    'sort_by(.start_epoch | tonumber) | .[(if length > $lim then length - $lim else 0 end):][] | [.id, .status, .start_epoch, .duration, .indices, .successful_shards, .total_shards] | map(tostring) | @tsv' \
+    'map(select(.status == "SUCCESS")) | sort_by(.start_epoch | tonumber) | .[(if length > $lim then length - $lim else 0 end):][] | [.id, .start_epoch, .duration, .indices, .successful_shards, .total_shards] | map(tostring) | @tsv' \
     "$ES_RESP" >"$TMP_DIR/snaplist.tsv"
-  SNAP_IDS=(); SNAP_STATUSES=()
-  printf '%s%4s  %-42s %-11s %-19s %9s %8s %15s%s\n' "$C_BLD" "#" "SNAPSHOT" "STATUS" "START" "DURATION" "INDICES" "SHARDS OK/TOT" "$C_RST"
-  while IFS=$'\t' read -r id st ep dur nidx okc tot; do
-    i=$((i + 1)); SNAP_IDS+=("$id"); SNAP_STATUSES+=("$st")
+  SNAP_IDS=()
+  printf '%s%4s  %-42s %-19s %9s %8s %15s%s\n' "$C_BLD" "#" "SNAPSHOT" "START" "DURATION" "INDICES" "SHARDS OK/TOT" "$C_RST"
+  while IFS=$'\t' read -r id ep dur nidx okc tot; do
+    i=$((i + 1)); SNAP_IDS+=("$id")
     when=$(date -d "@$ep" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ep")
-    printf '%4s  %-42s %-11s %-19s %9s %8s %15s\n' "$i" "$id" "$st" "$when" "$dur" "$nidx" "$okc/$tot"
+    printf '%4s  %-42s %-19s %9s %8s %15s\n' "$i" "$id" "$when" "$dur" "$nidx" "$okc/$tot"
   done <"$TMP_DIR/snaplist.tsv"
-  info "Showing $i of $total snapshot(s) (most recent last)."
+  info "Showing $i of $total SUCCESS snapshot(s) (most recent last)."
+  (( hidden > 0 )) && info "$hidden snapshot(s) not in SUCCESS state (PARTIAL/FAILED/...) are hidden."
   (( i > 0 ))
 }
 
 choose_existing_snapshot() {
   local choice sel st
-  list_snapshots || { warn "No snapshots available."; return 1; }
+  list_snapshots || { warn "No SUCCESS snapshots available."; return 1; }
   while true; do
     read -r -p "Snapshot number (or exact name; 'q' to go back): " choice || return 1
     [[ $choice == q || $choice == Q ]] && return 1
     [[ -z $choice ]] && continue
     if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#SNAP_IDS[@]} )); then
-      sel=${SNAP_IDS[choice - 1]}; st=${SNAP_STATUSES[choice - 1]}
+      sel=${SNAP_IDS[choice - 1]}
     else
-      sel=$choice; st=""
-    fi
-    if [[ -z $st ]]; then
+      sel=$choice
       if ! fetch_snapshot_info "$sel"; then err "Snapshot '$sel' not found in the destination repo '$DEST_RO_REPO_FOR_SOURCE'."; continue; fi
       st=$(jq -r '.state' "$TMP_DIR/snap.json")
+      [[ $st == SUCCESS ]] || { err "Snapshot '$sel' is in state '$st'. Only SUCCESS snapshots can be used."; continue; }
     fi
-    case $st in
-      SUCCESS) ;;
-      PARTIAL)
-        if [[ $ALLOW_PARTIAL_SNAPSHOTS != true ]]; then err "PARTIAL snapshot not allowed (ALLOW_PARTIAL_SNAPSHOTS=false)."; continue; fi
-        warn "PARTIAL snapshot: indices with failed shards will be excluded from the restore." ;;
-      *) err "Snapshot with state '$st' can't be used."; continue ;;
-    esac
     SELECTED_SNAPSHOT=$sel
     ok "Selected snapshot: $sel"
     return 0
   done
-}
-
-# ----------------------------------------------------------------------------
-# Temporary destination tuning
-# ----------------------------------------------------------------------------
-TUNE_KEYS='["indices.recovery.max_bytes_per_sec","cluster.routing.allocation.node_initial_primaries_recoveries","cluster.routing.allocation.node_concurrent_recoveries"]'
-
-apply_dest_tuning() {
-  local backup="$STATE_DIR/dest_tuning_backup.json" body
-  es_request dest GET "/_cluster/settings?flat_settings=true" || { err "Failed to read destination settings: $(es_error)"; return 1; }
-  if [[ -f $backup ]]; then
-    info "A previous tuning backup already exists ($backup); keeping its original values."
-  else
-    jq --argjson k "$TUNE_KEYS" '(.transient // {}) as $t | reduce $k[] as $x ({}; .[$x] = ($t[$x] // null))' "$ES_RESP" >"$backup"
-  fi
-  body=$(jq -cn --arg a "$DEST_TUNE_RECOVERY_MAX_BYTES_PER_SEC" --arg b "$DEST_TUNE_NODE_INITIAL_PRIMARIES_RECOVERIES" \
-               --arg c "$DEST_TUNE_NODE_CONCURRENT_RECOVERIES" '
-    {transient: ({}
-      + (if $a != "" then {"indices.recovery.max_bytes_per_sec": $a} else {} end)
-      + (if $b != "" then {"cluster.routing.allocation.node_initial_primaries_recoveries": $b} else {} end)
-      + (if $c != "" then {"cluster.routing.allocation.node_concurrent_recoveries": $c} else {} end))}')
-  es_request dest PUT "/_cluster/settings" "$body" || { err "Failed to apply tuning: $(es_error)"; return 1; }
-  ok "Temporary tuning applied on the DESTINATION: $(jq -c '.transient' <<<"$body")"
-}
-
-reset_dest_tuning() {
-  local backup="$STATE_DIR/dest_tuning_backup.json" body
-  [[ -f $backup ]] || { info "No pending temporary tuning on the destination."; return 0; }
-  body=$(jq -c '{transient: .}' "$backup")
-  if es_request dest PUT "/_cluster/settings" "$body"; then
-    rm -f "$backup"
-    ok "DESTINATION transient settings restored: $(jq -c '.transient' <<<"$body")"
-  else
-    err "Failed to restore destination settings: $(es_error). Backup kept at $backup"; return 1
-  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -641,8 +586,8 @@ estimate_resources() {
 }
 
 restore_snapshot() {
-  local snap=$1 ro_enc snap_enc st sver sstart n_snap n_match n_failed n_cand n_open n_closed n_alias n_conf
-  local action use_list n_restore n_delete body body_size ts state_file tuned=false c
+  local snap=$1 ro_enc snap_enc st sver sstart n_snap n_match n_open n_closed n_alias n_conf
+  local action use_list n_restore n_delete body body_size ts state_file c
   [[ -n $snap ]] || { err "No snapshot given."; return 1; }
   ro_enc=$(urlenc "$DEST_RO_REPO_FOR_SOURCE"); snap_enc=$(urlenc "$snap")
   ensure_cluster_names
@@ -650,11 +595,7 @@ restore_snapshot() {
   title "Restore planning"
   fetch_snapshot_info "$snap" || { err "Snapshot '$snap' not found in repo '$DEST_RO_REPO_FOR_SOURCE' on the DESTINATION: $(es_error)"; return 1; }
   IFS=$'\t' read -r st sver sstart < <(jq -r '[.state, (.version // "?"), (.start_time // "?")] | @tsv' "$TMP_DIR/snap.json")
-  case $st in
-    SUCCESS) ;;
-    PARTIAL) [[ $ALLOW_PARTIAL_SNAPSHOTS == true ]] || { err "PARTIAL snapshot and ALLOW_PARTIAL_SNAPSHOTS=false."; return 1; } ;;
-    *) err "Snapshot in state '$st' can't be restored."; return 1 ;;
-  esac
+  [[ $st == SUCCESS ]] || { err "Snapshot is in state '$st'. Only SUCCESS snapshots can be restored."; return 1; }
   if [[ $sver != "?" && -n $DST_VERSION ]] && (( $(ver_num "$sver") > $(ver_num "$DST_VERSION") )); then
     err "Snapshot was created on version $sver, newer than the destination ($DST_VERSION)."; return 1
   fi
@@ -668,29 +609,22 @@ restore_snapshot() {
         --arg pat "$RESTORE_INDICES" "$JQ_LIB"$'\n''
     $s[0] as $snap
     | es_patterns($pat) as $P
-    | ([ ($snap.failures // [])[] | .index ] | unique) as $failed
-    | ($failed | to_set) as $F
     | ($d[0] | reduce .[] as $x ({}; .[$x.index] = $x.status)) as $D
     | ([ $a[0][] | .alias ] | to_set) as $A
-    | [ ($snap.indices // [])[] | select(es_match($P)) ] as $matched
-    | [ $matched[] | select($F[.] | not) ] as $cand
+    | [ ($snap.indices // [])[] | select(es_match($P)) ] as $cand
     | { snapshot_indices: ($snap.indices // [] | length),
-        matched: ($matched | length),
-        excluded_failed: [ $matched[] | select($F[.]) ],
+        matched: ($cand | length),
         candidates: $cand,
         conflicts_open:   [ $cand[] | select($D[.] == "open") ],
         conflicts_closed: [ $cand[] | select($D[.] != null and $D[.] != "open") ],
         conflicts_alias:  [ $cand[] | select($A[.]) ] }' >"$TMP_DIR/plan.json" \
     || { err "Failed to build the restore plan."; return 1; }
 
-  read -r n_snap n_match n_failed n_cand n_open n_closed n_alias < <(jq -r \
-    '[.snapshot_indices, .matched, (.excluded_failed | length), (.candidates | length), (.conflicts_open | length), (.conflicts_closed | length), (.conflicts_alias | length)] | map(tostring) | join(" ")' \
+  read -r n_snap n_match n_open n_closed n_alias < <(jq -r \
+    '[.snapshot_indices, .matched, (.conflicts_open | length), (.conflicts_closed | length), (.conflicts_alias | length)] | map(tostring) | join(" ")' \
     "$TMP_DIR/plan.json")
   info "Snapshot '$snap' ($st, version $sver, started $sstart): $n_snap index(es); $n_match match '$RESTORE_INDICES'."
-  if (( n_failed > 0 )); then
-    warn "$n_failed index(es) with failed shards in the snapshot will be excluded: $(jq -r '.excluded_failed[:20] | join(", ")' "$TMP_DIR/plan.json")"
-  fi
-  (( n_cand > 0 )) || { err "No indices to restore."; return 1; }
+  (( n_match > 0 )) || { err "No indices to restore."; return 1; }
 
   action="none"
   n_conf=$(( n_open + n_closed + n_alias ))
@@ -733,11 +667,11 @@ restore_snapshot() {
   estimate_resources "$snap" || { info "Restore cancelled."; return 1; }
 
   jq -cn --slurpfile r "$TMP_DIR/to_restore.json" --arg pat "$RESTORE_INDICES" --argjson uselist "$use_list" \
-         --argjson aliases "$RESTORE_INCLUDE_ALIASES" --arg ign "$RESTORE_IGNORE_INDEX_SETTINGS" '
+         --arg ign "$RESTORE_IGNORE_INDEX_SETTINGS" '
     { indices: (if $uselist then $r[0] else $pat end),
       ignore_unavailable: true,
       include_global_state: false,
-      include_aliases: $aliases,
+      include_aliases: true,
       partial: false }
     + (if $ign != "" then {ignore_index_settings: $ign} else {} end)' >"$TMP_DIR/restore_body.json"
   body=$(<"$TMP_DIR/restore_body.json")
@@ -755,9 +689,8 @@ restore_snapshot() {
   fi
   (( n_delete > 0 )) && info "${C_RED}Indices to DELETE on the destination before the restore: $n_delete${C_RST}"
   info "Primaries / replicas   : kept as in the snapshot (no index_settings are sent)"
-  info "include_global_state   : false | include_aliases: $RESTORE_INCLUDE_ALIASES"
+  info "include_global_state   : false | include_aliases: true"
   [[ -n $RESTORE_IGNORE_INDEX_SETTINGS ]] && info "ignore_index_settings  : $RESTORE_IGNORE_INDEX_SETTINGS"
-  info "Temporary tuning       : $DEST_TUNE_DURING_RESTORE"
   info "The SOURCE (production) cluster is not accessed by the restore: data is read directly from the Storage Account."
   if (( body_size > 900000 )); then
     warn "The restore request body is $(human_bytes "$body_size"); the nginx ingress (proxy-body-size, default 1m) may reject it."
@@ -772,14 +705,9 @@ restore_snapshot() {
     delete_dest_indices "$TMP_DIR/to_delete.json" || { err "Failed to delete indices; restore not started."; return 1; }
   fi
 
-  if [[ $DEST_TUNE_DURING_RESTORE == true ]]; then
-    if apply_dest_tuning; then tuned=true; else warn "Continuing without tuning."; fi
-  fi
-
   info "Sending restore request..."
   if ! es_request dest POST "/_snapshot/${ro_enc}/${snap_enc}/_restore?wait_for_completion=false" "$body"; then
     err "Restore rejected: $(es_error)"
-    [[ $tuned == true ]] && reset_dest_tuning
     return 1
   fi
   ok "Restore accepted by the destination cluster."
@@ -787,8 +715,8 @@ restore_snapshot() {
   ts=$(date '+%Y%m%d-%H%M%S')
   state_file="$STATE_DIR/restore-$ts.json"
   jq -n --arg snap "$snap" --arg repo "$DEST_RO_REPO_FOR_SOURCE" --arg url "$DEST_ES_URL" --arg at "$(date '+%F %T')" \
-        --argjson tuned "$tuned" --slurpfile r "$TMP_DIR/to_restore.json" \
-        '{snapshot: $snap, repository: $repo, dest_url: $url, started_at: $at, tuning_applied: $tuned, indices: $r[0]}' >"$state_file"
+        --slurpfile r "$TMP_DIR/to_restore.json" \
+        '{snapshot: $snap, repository: $repo, dest_url: $url, started_at: $at, indices: $r[0]}' >"$state_file"
   cp "$state_file" "$STATE_DIR/last_restore.json"
   info "State saved to $state_file"
 
@@ -814,7 +742,7 @@ monitor_restore() {
   jq '.indices' "$sf" >"$TMP_DIR/mon_idx.json"
   snap=$(jq -r '.snapshot' "$sf"); n=$(jq 'length' "$TMP_DIR/mon_idx.json")
   title "Monitoring restore of snapshot '$snap' ($n indices) on the DESTINATION"
-  info "Polling every ${RESTORE_POLL_INTERVAL}s. Ctrl+C stops only the monitoring (the restore keeps running on the cluster)."
+  info "Polling every ${POLL_INTERVAL}s. Ctrl+C stops only the monitoring (the restore keeps running on the cluster)."
   start=$SECONDS
   _INTERRUPTED=0
   trap '_INTERRUPTED=1' INT
@@ -848,7 +776,7 @@ monitor_restore() {
     else
       warn "Failed to query shards: $(es_error)"
     fi
-    sleep "$RESTORE_POLL_INTERVAL"
+    sleep "$POLL_INTERVAL"
   done
   trap - INT
 
@@ -861,7 +789,6 @@ monitor_restore() {
     done)
       ok "Restore complete: all shards (primaries and replicas) are STARTED. Monitored time: $(fmt_duration $((SECONDS - start)))"
       jq --arg at "$(date '+%F %T')" '.completed_at = $at' "$sf" >"$TMP_DIR/sf.json" && cp "$TMP_DIR/sf.json" "$sf"
-      if [[ -f $STATE_DIR/dest_tuning_backup.json ]]; then reset_dest_tuning; fi
       verify_restore
       ;;
     failed)
@@ -891,14 +818,11 @@ verify_restore() {
   es_request dest GET "/_cat/indices?format=json&h=index,health,status,pri,rep,docs.count" "" "$CURL_LONG_MAX_TIME" \
     || { err "Failed to read destination indices: $(es_error)"; return 1; }
   cp "$ES_RESP" "$TMP_DIR/ver_dst.json"
-  if [[ $VERIFY_COMPARE_WITH_SOURCE == true ]]; then
-    if es_request source GET "/_cat/indices?format=json&h=index,pri,rep,docs.count" "" "$CURL_LONG_MAX_TIME"; then
-      cp "$ES_RESP" "$TMP_DIR/ver_src.json"
-    else
-      warn "Failed to read source indices ($(es_error)); comparing only against the expected standard."
-      echo '[]' >"$TMP_DIR/ver_src.json"
-    fi
+  # Always compares with the source (a single light _cat/indices read)
+  if es_request source GET "/_cat/indices?format=json&h=index,pri,rep,docs.count" "" "$CURL_LONG_MAX_TIME"; then
+    cp "$ES_RESP" "$TMP_DIR/ver_src.json"
   else
+    warn "Failed to read source indices ($(es_error)); comparing only against the expected standard."
     echo '[]' >"$TMP_DIR/ver_src.json"
   fi
 
@@ -962,7 +886,7 @@ run_preflight_or_fix() {
   if preflight; then return 0; fi
   if (( PF_RO_REPO_MISSING )); then
     if confirm_yes "Read-only repository '$DEST_RO_REPO_FOR_SOURCE' does not exist on the destination. Register it now?"; then
-      register_ro_repo source "$SOURCE_REPO" dest "$DEST_RO_REPO_FOR_SOURCE" "$DEST_RO_REPO_CLIENT" "$DEST_RO_REPO_MAX_RESTORE_BYTES_PER_SEC" \
+      register_ro_repo source "$SOURCE_REPO" dest "$DEST_RO_REPO_FOR_SOURCE" \
         && preflight && return 0
     fi
   fi
@@ -1000,7 +924,6 @@ main_menu() {
     echo "4) Monitor the last restore"
     echo "5) Verify indices from the last restore"
     echo "6) Register read-only repository"
-    echo "7) Revert temporary destination tuning"
     echo "0) Exit"
     read -r -p "Option: " c || { echo; return 0; }
     case $c in
@@ -1010,7 +933,6 @@ main_menu() {
       4) monitor_restore ;;
       5) verify_restore ;;
       6) register_repo_menu ;;
-      7) reset_dest_tuning ;;
       0|q|Q) return 0 ;;
       *) echo "Invalid option." ;;
     esac
@@ -1031,8 +953,7 @@ Without a command, opens the interactive menu. Commands:
   restore <snapshot>  restore the given snapshot on the destination
   monitor             monitor the last restore
   verify              verify the indices of the last restore
-  register-repo       register a read-only repository
-  reset-tuning        revert the temporary tuning applied on the destination
+  register-repo       register the source repository as read-only on the destination
 
 Options:
   -c, --config FILE   configuration file (default: $SCRIPT_DIR/config.env)
@@ -1073,7 +994,6 @@ main() {
     monitor) monitor_restore ;;
     verify) verify_restore ;;
     register-repo) register_repo_menu ;;
-    reset-tuning) reset_dest_tuning ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac
 }
