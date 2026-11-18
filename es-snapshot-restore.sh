@@ -186,6 +186,8 @@ load_config() {
   : "${RESTORE_INDICES:=*,-.*}" "${RESTORE_IGNORE_INDEX_SETTINGS:=}"
   : "${ON_CONFLICT:=ask}" "${CHECK_DISK_BEFORE_RESTORE:=true}" "${DISK_WATERMARK_PERCENT:=85}"
   : "${EXPECTED_PRIMARY_SHARDS:=3}" "${EXPECTED_REPLICAS:=1}"
+  : "${DEST_TUNE_DURING_RESTORE:=false}" "${DEST_TUNE_MAX_BYTES_PER_SEC:=50mb}"
+  : "${DEST_TUNE_PRIMARIES_IN_PARALLEL:=8}" "${DEST_TUNE_REPLICAS_IN_PARALLEL:=4}"
   : "${CURL_CONNECT_TIMEOUT:=10}" "${CURL_MAX_TIME:=120}" "${CURL_LONG_MAX_TIME:=600}"
   : "${LOG_DIR:=./logs}" "${STATE_DIR:=./state}"
 
@@ -202,9 +204,17 @@ load_config() {
   SNAPSHOT_NAME_PREFIX=${SNAPSHOT_NAME_PREFIX,,}
 
   case $ON_CONFLICT in ask|abort|skip|delete) ;; *) die "Invalid ON_CONFLICT: '$ON_CONFLICT' (use ask|abort|skip|delete)" ;; esac
-  for v in SOURCE_INSECURE_TLS DEST_INSECURE_TLS CHECK_DISK_BEFORE_RESTORE; do
+  for v in SOURCE_INSECURE_TLS DEST_INSECURE_TLS CHECK_DISK_BEFORE_RESTORE DEST_TUNE_DURING_RESTORE; do
     [[ ${!v} == true || ${!v} == false ]] || die "$v must be true or false (current: '${!v}')"
   done
+  if [[ $DEST_TUNE_DURING_RESTORE == true ]]; then
+    DEST_TUNE_MAX_BYTES_PER_SEC=${DEST_TUNE_MAX_BYTES_PER_SEC,,}
+    [[ $DEST_TUNE_MAX_BYTES_PER_SEC =~ ^[0-9]+(b|kb|mb|gb)$ ]] \
+      || die "DEST_TUNE_MAX_BYTES_PER_SEC must look like 200mb (current: '$DEST_TUNE_MAX_BYTES_PER_SEC')"
+    for v in DEST_TUNE_PRIMARIES_IN_PARALLEL DEST_TUNE_REPLICAS_IN_PARALLEL; do
+      [[ ${!v} =~ ^[1-9][0-9]*$ ]] || die "$v must be a positive integer (current: '${!v}')"
+    done
+  fi
   for v in SNAPSHOT_LIST_LIMIT DISK_WATERMARK_PERCENT EXPECTED_PRIMARY_SHARDS \
            EXPECTED_REPLICAS CURL_CONNECT_TIMEOUT CURL_MAX_TIME CURL_LONG_MAX_TIME; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be numeric (current: '${!v}')"
@@ -533,6 +543,131 @@ choose_existing_snapshot() {
 }
 
 # ----------------------------------------------------------------------------
+# Temporary restore tuning (DESTINATION only)
+#
+# Before the restore: saves the current values, then raises
+#   - max_restore_bytes_per_sec on the read-only repo   (download speed per node)
+#   - indices.recovery.max_bytes_per_sec                 (replica copy speed per node)
+#   - cluster.routing.allocation.node_initial_primaries_recoveries  (primaries in parallel per node)
+#   - cluster.routing.allocation.node_concurrent_recoveries         (replicas in parallel per node)
+# After the restore: puts every saved value back. The saved values live in
+# $STATE_DIR/dest_tuning_backup.json until they are restored; if the tool is
+# interrupted, the next run reverts them automatically once the restore is over.
+# Nothing is ever changed on the SOURCE cluster.
+# ----------------------------------------------------------------------------
+TUNE_CLUSTER_KEYS='["indices.recovery.max_bytes_per_sec","cluster.routing.allocation.node_initial_primaries_recoveries","cluster.routing.allocation.node_concurrent_recoveries"]'
+SHARDS_PATH="/_cat/shards?format=json&h=index,prirep,state,unassigned.reason"
+
+tuning_backup_file() { echo "$STATE_DIR/dest_tuning_backup.json"; }
+
+apply_dest_tuning() {
+  local backup ro=$DEST_RO_REPO_FOR_SOURCE body
+  backup=$(tuning_backup_file)
+  if [[ -f $backup ]]; then
+    info "A previous tuning backup exists ($backup); keeping the original values saved in it."
+  else
+    es_request dest GET "/_cluster/settings?flat_settings=true" || { err "Failed to read destination cluster settings: $(es_error)"; return 1; }
+    cp "$ES_RESP" "$TMP_DIR/cluster_settings.json"
+    es_request dest GET "/_snapshot/$(urlenc "$ro")" || { err "Failed to read repository '$ro': $(es_error)"; return 1; }
+    jq --arg r "$ro" '.[$r]' "$ES_RESP" >"$TMP_DIR/ro_def.json"
+    jq -n --argjson k "$TUNE_CLUSTER_KEYS" --arg r "$ro" \
+          --slurpfile c "$TMP_DIR/cluster_settings.json" --slurpfile p "$TMP_DIR/ro_def.json" '
+      { repository: $r,
+        repository_definition: { type: $p[0].type, settings: ($p[0].settings // {}) },
+        cluster_transient: (($c[0].transient // {}) as $t | reduce $k[] as $x ({}; .[$x] = ($t[$x] // null))) }' \
+      >"$backup" || { err "Failed to save the tuning backup."; rm -f "$backup"; return 1; }
+    info "Current values saved to $backup"
+  fi
+
+  body=$(jq -cn --arg m "$DEST_TUNE_MAX_BYTES_PER_SEC" --arg p "$DEST_TUNE_PRIMARIES_IN_PARALLEL" --arg r "$DEST_TUNE_REPLICAS_IN_PARALLEL" '
+    {transient: {"indices.recovery.max_bytes_per_sec": $m,
+                 "cluster.routing.allocation.node_initial_primaries_recoveries": $p,
+                 "cluster.routing.allocation.node_concurrent_recoveries": $r}}')
+  es_request dest PUT "/_cluster/settings" "$body" || { err "Failed to apply cluster tuning: $(es_error)"; return 1; }
+
+  body=$(jq -c --arg m "$DEST_TUNE_MAX_BYTES_PER_SEC" \
+    '.repository_definition | .settings = (.settings + {readonly: true, max_restore_bytes_per_sec: $m})' "$backup")
+  es_request dest PUT "/_snapshot/$(urlenc "$ro")" "$body" || { err "Failed to update repository '$ro': $(es_error)"; return 1; }
+
+  ok "Temporary tuning applied on the DESTINATION: up to $DEST_TUNE_MAX_BYTES_PER_SEC/s per node," \
+     "$DEST_TUNE_PRIMARIES_IN_PARALLEL primaries and $DEST_TUNE_REPLICAS_IN_PARALLEL replicas in parallel per node."
+}
+
+# Puts back every value saved by apply_dest_tuning. Keeps the backup if something fails.
+revert_dest_tuning() {
+  local backup ro body fails=0
+  backup=$(tuning_backup_file)
+  [[ -f $backup ]] || return 0
+  ro=$(jq -r '.repository' "$backup")
+  info "Reverting the temporary tuning on the DESTINATION..."
+
+  body=$(jq -c '{transient: .cluster_transient}' "$backup")
+  if es_request dest PUT "/_cluster/settings" "$body"; then
+    ok "Cluster settings back to their previous values: $(jq -c '.transient' <<<"$body")"
+  else
+    err "Failed to restore cluster settings: $(es_error)"; ((fails++))
+  fi
+
+  body=$(jq -c '.repository_definition | .settings = (.settings + {readonly: true})' "$backup")
+  if es_request dest PUT "/_snapshot/$(urlenc "$ro")" "$body"; then
+    ok "Repository '$ro' back to its previous settings (max_restore_bytes_per_sec: $(jq -r '.settings.max_restore_bytes_per_sec // "40mb (default)"' <<<"$body"))."
+  else
+    err "Failed to restore repository '$ro': $(es_error)"; ((fails++))
+  fi
+
+  if (( fails == 0 )); then
+    rm -f "$backup"
+    ok "Temporary tuning reverted."
+  else
+    warn "Backup kept at $backup; the tool will try again the next time it runs."
+    return 1
+  fi
+}
+
+# Prints "pt ps rt rs ip ir un fl ni" (primaries total/started, replicas total/started,
+# primaries/replicas initializing, unassigned, allocation failed, indices found) for the
+# indices in the JSON array file $1, reading the _cat/shards response in $ES_RESP.
+shard_progress() {
+  jq -r --slurpfile n "$1" '
+    ($n[0] | reduce .[] as $x ({}; .[$x] = true)) as $N
+    | map(select($N[.index])) as $s
+    | [ ($s | map(select(.prirep == "p")) | length),
+        ($s | map(select(.prirep == "p" and .state == "STARTED")) | length),
+        ($s | map(select(.prirep == "r")) | length),
+        ($s | map(select(.prirep == "r" and .state == "STARTED")) | length),
+        ($s | map(select(.prirep == "p" and .state == "INITIALIZING")) | length),
+        ($s | map(select(.prirep == "r" and .state == "INITIALIZING")) | length),
+        ($s | map(select(.state == "UNASSIGNED")) | length),
+        ($s | map(select(.["unassigned.reason"] == "ALLOCATION_FAILED")) | length),
+        ($s | map(.index) | unique | length) ] | map(tostring) | join(" ")' "$ES_RESP"
+}
+
+# Runs at startup: if a tuning backup is pending (e.g. the tool was interrupted during
+# a restore), reverts it as soon as the last restore is no longer running.
+check_pending_tuning() {
+  local backup line pt ps rt rs ip ir un fl ni
+  backup=$(tuning_backup_file)
+  [[ -f $backup ]] || return 0
+  title "Temporary restore tuning still applied on the DESTINATION"
+  if [[ -f $STATE_DIR/last_restore.json ]]; then
+    jq '.indices' "$STATE_DIR/last_restore.json" >"$TMP_DIR/pending_idx.json"
+    if ! es_request dest GET "$SHARDS_PATH" "" "$CURL_LONG_MAX_TIME"; then
+      warn "Could not check the last restore ($(es_error)); the tuning stays for now."
+      return 0
+    fi
+    line=$(shard_progress "$TMP_DIR/pending_idx.json")
+    read -r pt ps rt rs ip ir un fl ni <<<"$line"
+    if (( ${ip:-0} > 0 || ${ir:-0} > 0 || ${un:-0} > ${fl:-0} )); then
+      info "The last restore is still running (primaries $ps/$pt, replicas $rs/$rt)."
+      info "The tuning stays on until it finishes. Option 4 (Monitor) reverts it automatically at the end."
+      return 0
+    fi
+  fi
+  info "The last restore is no longer running."
+  revert_dest_tuning
+}
+
+# ----------------------------------------------------------------------------
 # Restore
 # ----------------------------------------------------------------------------
 # Estimates disk/shards. Uses $TMP_DIR/to_restore.json. Returns 1 if the user gives up.
@@ -691,6 +826,12 @@ restore_snapshot() {
   info "Primaries / replicas   : kept as in the snapshot (no index_settings are sent)"
   info "include_global_state   : false | include_aliases: true"
   [[ -n $RESTORE_IGNORE_INDEX_SETTINGS ]] && info "ignore_index_settings  : $RESTORE_IGNORE_INDEX_SETTINGS"
+  if [[ $DEST_TUNE_DURING_RESTORE == true ]]; then
+    info "Temporary tuning       : ON - up to $DEST_TUNE_MAX_BYTES_PER_SEC/s per node, $DEST_TUNE_PRIMARIES_IN_PARALLEL primaries and" \
+         "$DEST_TUNE_REPLICAS_IN_PARALLEL replicas in parallel per node (DESTINATION only; previous values are restored after the restore)"
+  else
+    info "Temporary tuning       : off (Elasticsearch defaults)"
+  fi
   info "The SOURCE (production) cluster is not accessed by the restore: data is read directly from the Storage Account."
   if (( body_size > 900000 )); then
     warn "The restore request body is $(human_bytes "$body_size"); the nginx ingress (proxy-body-size, default 1m) may reject it."
@@ -705,9 +846,16 @@ restore_snapshot() {
     delete_dest_indices "$TMP_DIR/to_delete.json" || { err "Failed to delete indices; restore not started."; return 1; }
   fi
 
+  if [[ $DEST_TUNE_DURING_RESTORE == true ]] && ! apply_dest_tuning; then
+    revert_dest_tuning
+    confirm_yes "The temporary tuning could not be applied. Continue the restore with the normal settings?" \
+      || { info "Restore cancelled."; return 1; }
+  fi
+
   info "Sending restore request..."
   if ! es_request dest POST "/_snapshot/${ro_enc}/${snap_enc}/_restore?wait_for_completion=false" "$body"; then
     err "Restore rejected: $(es_error)"
+    revert_dest_tuning
     return 1
   fi
   ok "Restore accepted by the destination cluster."
@@ -747,19 +895,8 @@ monitor_restore() {
   _INTERRUPTED=0
   trap '_INTERRUPTED=1' INT
   while (( ! _INTERRUPTED )); do
-    if es_request dest GET "/_cat/shards?format=json&h=index,prirep,state,unassigned.reason" "" "$CURL_LONG_MAX_TIME"; then
-      line=$(jq -r --slurpfile n "$TMP_DIR/mon_idx.json" '
-        ($n[0] | reduce .[] as $x ({}; .[$x] = true)) as $N
-        | map(select($N[.index])) as $s
-        | [ ($s | map(select(.prirep == "p")) | length),
-            ($s | map(select(.prirep == "p" and .state == "STARTED")) | length),
-            ($s | map(select(.prirep == "r")) | length),
-            ($s | map(select(.prirep == "r" and .state == "STARTED")) | length),
-            ($s | map(select(.prirep == "p" and .state == "INITIALIZING")) | length),
-            ($s | map(select(.prirep == "r" and .state == "INITIALIZING")) | length),
-            ($s | map(select(.state == "UNASSIGNED")) | length),
-            ($s | map(select(.["unassigned.reason"] == "ALLOCATION_FAILED")) | length),
-            ($s | map(.index) | unique | length) ] | map(tostring) | join(" ")' "$ES_RESP")
+    if es_request dest GET "$SHARDS_PATH" "" "$CURL_LONG_MAX_TIME"; then
+      line=$(shard_progress "$TMP_DIR/mon_idx.json")
       read -r pt ps rt rs ip ir un fl ni <<<"$line"
       if (( pt == 0 )); then
         empty_polls=$((empty_polls + 1))
@@ -783,8 +920,14 @@ monitor_restore() {
   if (( _INTERRUPTED )); then
     echo
     warn "Monitoring interrupted. The restore keeps running on the destination; use the 'monitor' command to resume."
+    if [[ -f $(tuning_backup_file) ]]; then
+      info "The temporary tuning stays on while the restore runs. It is reverted automatically when 'monitor' sees the"
+      info "end of the restore, or the next time the tool runs after the restore has finished."
+    fi
     return 1
   fi
+  # The restore is no longer progressing (finished, failed or never started): put the settings back
+  revert_dest_tuning
   case $result in
     done)
       ok "Restore complete: all shards (primaries and replicas) are STARTED. Monitored time: $(fmt_duration $((SECONDS - start)))"
@@ -977,6 +1120,7 @@ main() {
   setup_runtime
   ask_passwords
   info "Log: $LOG_FILE"
+  check_pending_tuning
 
   case $cmd in
     "") main_menu ;;

@@ -36,6 +36,15 @@ Each action can also be run directly as a command: `check`, `run`, `list`, `snap
 
 Logs and CSV reports go to `./logs`. The state of the last restore is kept in `./state`.
 
+## Restore tuning (optional)
+
+With `DEST_TUNE_DURING_RESTORE="true"`, the tool raises the restore limits on the **destination only** while the restore
+runs: the per-node bandwidth (`DEST_TUNE_MAX_BYTES_PER_SEC`) and how many primaries/replicas each node recovers in
+parallel (`DEST_TUNE_PRIMARIES_IN_PARALLEL`, `DEST_TUNE_REPLICAS_IN_PARALLEL`). Before applying them it saves the current
+values (destination cluster settings and the read-only repository). When the restore ends, it puts those values back
+automatically. If the tool is interrupted, it reverts them on the next run, once the restore has finished. The source
+cluster is never changed.
+
 ## Caveats
 
 - **Curator and a snapshot in use**: if curator's `delete_snapshots` deletes the snapshot while the destination is still
